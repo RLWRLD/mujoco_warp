@@ -1520,6 +1520,198 @@ class CollisionTest(parameterized.TestCase):
         msg=f"Contact {i}: Expected penetration {expected_penetration:.4f}, got {mjw_dist[i]:.4f}",
       )
 
+  def test_mesh_mesh_tilted_plates_corners(self):
+    """Tests that stacked plates tilted by 1e-4 rad keep all four corner contacts."""
+    # the faces nearly coincide, so the clipped contact polygon has an extra vertex on an edge
+    _, _, m, d = test_data.fixture(
+      xml="""
+    <mujoco>
+      <asset>
+        <mesh name="plate" vertex="-0.105 -0.148 -0.002  -0.105 -0.148 0.002  -0.105 0.148 -0.002  -0.105 0.148 0.002
+                                   0.105 -0.148 -0.002  0.105 -0.148 0.002  0.105 0.148 -0.002  0.105 0.148 0.002"/>
+      </asset>
+      <worldbody>
+        <body>
+          <freejoint/>
+          <geom type="mesh" mesh="plate"/>
+        </body>
+        <body>
+          <freejoint/>
+          <geom type="mesh" mesh="plate"/>
+        </body>
+      </worldbody>
+      <keyframe>
+        <key qpos="-1.6223261e-08 -2.32252901e-08 0.041705858 1 -4.72192625e-07 -1.6113022e-08 1.7437829e-08
+                   -2.75672107e-07 2.84675451e-07 0.0453196019 1 -8.66265473e-05 -6.89853186e-05 2.15242117e-08"/>
+      </keyframe>
+    </mujoco>
+    """,
+      keyframe=0,
+    )
+
+    d.contact.pos.fill_(wp.inf)
+    mjw.kinematics(m, d)
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    self.assertEqual(nacon, 4)
+    xy = d.contact.pos.numpy()[:nacon, :2]
+    for corner in ((-0.105, -0.148), (-0.105, 0.148), (0.105, -0.148), (0.105, 0.148)):
+      self.assertLess(np.linalg.norm(xy - corner, axis=1).min(), 1e-4, f"no contact at corner {corner}")
+
+  def test_cylinder_box_contacts_coherent(self):
+    """Tests that a cylinder cap on a box keeps the same contacts under a 1e-6 rad yaw."""
+    # the cap is a regular polygon, so several quadrilaterals span it equally
+    pos = []
+    for yaw in (0.0, 1e-6):
+      _, _, m, d = test_data.fixture(
+        xml=f"""
+      <mujoco>
+        <worldbody>
+          <geom type="box" size="0.5 0.5 0.02" pos="0 0 0.02"/>
+          <body>
+            <freejoint/>
+            <geom type="cylinder" size="0.05 0.05"/>
+          </body>
+        </worldbody>
+        <keyframe>
+          <key qpos="0 0 0.0897 {np.cos(yaw / 2)} 0 0 {np.sin(yaw / 2)}"/>
+        </keyframe>
+      </mujoco>
+      """,
+        keyframe=0,
+      )
+
+      d.contact.pos.fill_(wp.inf)
+      mjw.kinematics(m, d)
+      mjw.collision(m, d)
+
+      nacon = d.nacon.numpy()[0]
+      self.assertEqual(nacon, 4)
+      pos.append(d.contact.pos.numpy()[:nacon])
+
+    dist = np.linalg.norm(pos[0][:, None] - pos[1][None], axis=2)
+    np.testing.assert_array_less(dist.min(axis=1), 1e-4)
+
+  def test_mesh_mesh_touching_plates_normal(self):
+    """Tests that exactly touching aligned plates get no contact with a tilted normal."""
+    # at zero depth the origin is on the boundary of the Minkowski difference
+    _, _, m, d = test_data.fixture(
+      xml="""
+    <mujoco>
+      <asset>
+        <mesh name="plate" vertex="-0.105 -0.148 -0.002  -0.105 -0.148 0.002  -0.105 0.148 -0.002  -0.105 0.148 0.002
+                                   0.105 -0.148 -0.002  0.105 -0.148 0.002  0.105 0.148 -0.002  0.105 0.148 0.002"/>
+      </asset>
+      <worldbody>
+        <body>
+          <freejoint/>
+          <geom type="mesh" mesh="plate"/>
+        </body>
+        <body>
+          <freejoint/>
+          <geom type="mesh" mesh="plate"/>
+        </body>
+      </worldbody>
+      <keyframe>
+        <key qpos="0 0 0.054 1 0 0 0  0 0 0.058 1 0 0 0"/>
+      </keyframe>
+    </mujoco>
+    """,
+      keyframe=0,
+    )
+
+    d.contact.frame.fill_(wp.inf)
+    mjw.kinematics(m, d)
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    normal = d.contact.frame.numpy()[:nacon, 0]
+    np.testing.assert_allclose(np.abs(normal[:, 2]), 1.0, atol=1e-6)
+
+  @parameterized.named_parameters(
+    (
+      "box",
+      '<geom type="box" size="0.2 0.2 0.2" pos="0 0 0.19972974"/>',
+      '<geom type="box" size="0.1 0.1 0.1"/>',
+      "4.37352625e-08 -4.40844481e-08 0.499540061 1 0 0 0",
+      -0.000189679241,
+    ),
+    (
+      "plates",
+      '<geom type="mesh" mesh="plate" pos="0 0 0.19972974"/>',
+      '<geom type="mesh" mesh="plate"/>',
+      "1.17604454e-10 2.09445308e-12 0.203728601 1 0 0 0",
+      -1.13885351e-06,
+    ),
+  )
+  def test_aligned_faces_not_separated(self, bottom: str, top: str, qpos: str, dist_mujoco: float):
+    """Tests that overlapping face-aligned geoms are not reported as separated by GJK."""
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+    <mujoco>
+      <asset>
+        <mesh name="plate" vertex="-0.105 -0.148 -0.002  -0.105 -0.148 0.002  -0.105 0.148 -0.002  -0.105 0.148 0.002
+                                   0.105 -0.148 -0.002  0.105 -0.148 0.002  0.105 0.148 -0.002  0.105 0.148 0.002"/>
+      </asset>
+      <worldbody>
+        {bottom}
+        <body>
+          <freejoint/>
+          {top}
+        </body>
+      </worldbody>
+      <keyframe>
+        <key qpos="{qpos}"/>
+      </keyframe>
+    </mujoco>
+    """,
+      keyframe=0,
+    )
+
+    d.contact.dist.fill_(wp.inf)
+    mjw.kinematics(m, d)
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    self.assertGreater(nacon, 0)
+    self.assertAlmostEqual(d.contact.dist.numpy()[:nacon].min(), dist_mujoco, delta=1e-7)
+
+  def test_box_mesh_ridge_contact_face(self):
+    """Tests that multicontact clips against the mesh face most aligned with the box face."""
+    # the ridge edge touches the box; its faces are tilted by 2 and 0.5 degrees
+    _, _, m, d = test_data.fixture(
+      xml="""
+    <mujoco>
+      <asset>
+        <mesh name="ridge" vertex="0 -0.03 0  -0.05 -0.03 0.00174603847  0.05 -0.03 0.00043634339  -0.05 -0.03 0.02
+                                   0.05 -0.03 0.02  0 0.03 0  -0.05 0.03 0.00174603847  0.05 0.03 0.00043634339
+                                   -0.05 0.03 0.02  0.05 0.03 0.02"/>
+      </asset>
+      <worldbody>
+        <geom type="box" size="0.2 0.2 0.01" pos="0 0 -0.01"/>
+        <body>
+          <freejoint/>
+          <geom type="mesh" mesh="ridge"/>
+        </body>
+      </worldbody>
+      <keyframe>
+        <key qpos="0 0 -0.0001 1 0 0 0"/>
+      </keyframe>
+    </mujoco>
+    """,
+      keyframe=0,
+    )
+
+    d.contact.frame.fill_(wp.inf)
+    mjw.kinematics(m, d)
+    mjw.collision(m, d)
+
+    nacon = d.nacon.numpy()[0]
+    self.assertEqual(nacon, 2)
+    normal = d.contact.frame.numpy()[:nacon, 0]
+    np.testing.assert_allclose(np.abs(normal[:, 2]), np.cos(np.radians(0.5)), atol=1e-6)
+
   _SDF_VOLUME = {
     "sdf_plane": """
         <mujoco>
